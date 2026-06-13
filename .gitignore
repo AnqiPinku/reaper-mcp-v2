@@ -1,0 +1,22 @@
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.venv/
+venv/
+env/
+.DS_Store
+Thumbs.db
+
+# Local MCP/client config and generated runtime data
+.mcp.json
+*.local.json
+reaper-mcp-ipc/
+
+# REAPER/audio project artifacts
+*.RPP
+*.RPP-bak
+*.wav
+*.mp3
+*.flac
+*.aif
+*.aiff

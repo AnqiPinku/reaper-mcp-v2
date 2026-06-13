@@ -1,0 +1,12 @@
+{
+  "_comment": "Copy this into your MCP client config and update the server path. The IPC channel is auto-derived (%APPDATA%\\reaper-mcp-ipc by default) and is independent of where this repository lives.",
+  "mcpServers": {
+    "reaper": {
+      "command": "python",
+      "args": ["C:\\path\\to\\reaper-mcp-v2\\server\\reaper_mcp_server.py"],
+      "env": {
+        "REAPER_MCP_TIMEOUT": "10"
+      }
+    }
+  }
+}

@@ -1,0 +1,77 @@
+name: CI
+
+on:
+  push:
+    branches:
+      - main
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  validate:
+    name: Validate REAPER MCP v2
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Compile Python server
+        run: python -m compileall server
+
+      - name: Run server tests
+        run: python server/test_server.py
+
+      - name: Check required files
+        shell: bash
+        run: |
+          test -f README.md
+          test -f LICENSE
+          test -f bridge/reaper_mcp_bridge.lua
+          test -f server/reaper_mcp_server.py
+          test -f server/test_server.py
+          test -f mcp-config-example.json
+
+      - name: Scan for local paths and secret markers
+        shell: bash
+        run: |
+          python - <<'PY'
+          from pathlib import Path
+          import sys
+
+          forbidden = [
+              "g" + "hp_",
+              "github" + "_pat_",
+              "GITHUB_PERSONAL" + "_ACCESS_TOKEN",
+              "A:" + r"\科广",
+              "A:" + r"\Support tools",
+              "Kontakt Factory" + " Library 2",
+              "A:" + r"\reaper-mcp-bridge-data",
+              "A:" + r"\MCP\reaper",
+              "C:" + r"\Users\XAQ",
+          ]
+          hits = []
+          for path in Path(".").rglob("*"):
+              if not path.is_file():
+                  continue
+              if any(part in {".git", "__pycache__"} for part in path.parts):
+                  continue
+              try:
+                  text = path.read_text(encoding="utf-8")
+              except UnicodeDecodeError:
+                  continue
+              for marker in forbidden:
+                  if marker in text:
+                      hits.append((str(path), marker))
+
+          if hits:
+              for path, marker in hits:
+                  print(f"{path}: {marker}")
+              sys.exit(1)
+          print("No forbidden local paths or secret markers found.")
+          PY
