@@ -44,6 +44,10 @@ def fake_bridge(bridge_dir, stop):
                        "name": payload["args"][0] or ""}
             elif func == "run_lua":
                 ret = 1  # pretend the lua returned 1
+            elif func == "render_to_wav":
+                ret = {"path": payload["args"][0],
+                       "source": payload["args"][1],
+                       "sample_rate": payload["args"][2]}
             elif func == "CountTracks":
                 ret = 3
             else:
@@ -126,6 +130,15 @@ def main():
         check("run_lua works", r["result"]["content"][0]["text"] == "1")
 
         r = rpc(proc, {"jsonrpc": "2.0", "id": 7, "method": "tools/call",
+                       "params": {"name": "render_to_wav",
+                                  "arguments": {"out_path": "A:/tmp/mix.wav"}}})
+        body = json.loads(r["result"]["content"][0]["text"])
+        check("render_to_wav passes path + defaults source/sample_rate",
+              body["path"] == "A:/tmp/mix.wav"
+              and body["source"] == "time_selection"
+              and body["sample_rate"] == 48000)
+
+        r = rpc(proc, {"jsonrpc": "2.0", "id": 8, "method": "tools/call",
                        "params": {"name": "nope", "arguments": {}}})
         check("unknown tool errors", "error" in r)
 

@@ -334,6 +334,25 @@ tool(
 )
 
 tool(
+    "render_to_wav",
+    "Render audio to a WAV file at a known path and return the absolute path "
+    "actually written -- the bridge from REAPER to audio analysis. source is "
+    "one of: 'time_selection' (master mix over the current time selection; the "
+    "default), 'master' (whole-project master mix), 'track:N' (track N soloed "
+    "through the master, 0-based), or 'region:N' (the N-th region, 0-based in "
+    "time order). Output is stereo WAV at sample_rate (default 48000). The "
+    "project's own render settings (and solo state for 'track:N') are saved "
+    "and restored, so this leaves the render dialog untouched.",
+    obj({"out_path": {"type": "string"},
+         "source": {"type": "string"},
+         "sample_rate": {"type": "integer", "minimum": 8000}},
+        ["out_path"]),
+    lambda b, a: b.call("render_to_wav",
+                        [a["out_path"], a.get("source", "time_selection"),
+                         a.get("sample_rate", 48000)]),
+)
+
+tool(
     "reaper_call",
     "Escape hatch: call ANY ReaScript API function by name with positional "
     "args. Example: func='CountTracks', args=[0]. Pointers returned by earlier "
