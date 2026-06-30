@@ -525,6 +525,121 @@ function DSL.render_project(path)
   return { ret = { rendered_to = path or '(project render path)' } }
 end
 
+-- render_to_wav(out_path, source, sample_rate)
+--   source: 'time_selection' (master mix over the time selection; default)
+--         | 'master'    (master mix, entire project)
+--         | 'track:N'   (track N soloed through the master, 0-based)
+--         | 'region:N'  (the N-th region, 0-based in time order)
+-- Renders ONE stereo WAV (default bit depth) to out_path and returns the
+-- absolute path actually written. The project's own render settings (and, for
+-- 'track:N', every track's solo state) are saved and restored, so the user's
+-- render dialog is left untouched. This is the bridge feeding audio analysis.
+function DSL.render_to_wav(out_path, source, sample_rate)
+  if not out_path or out_path == '' then error('out_path is required') end
+  source = source or 'time_selection'
+  sample_rate = sample_rate or 48000
+  if not out_path:lower():match('%.wav$') then out_path = out_path .. '.wav' end
+  local dir = out_path:match('^(.*)[/\\][^/\\]+$')
+  if dir then reaper.RecursiveCreateDirectory(dir, 0) end
+
+  local gp, gps = reaper.GetSetProjectInfo, reaper.GetSetProjectInfo_String
+  local saved = {
+    settings = gp(0, 'RENDER_SETTINGS', 0, false),
+    bounds   = gp(0, 'RENDER_BOUNDSFLAG', 0, false),
+    startpos = gp(0, 'RENDER_STARTPOS', 0, false),
+    endpos   = gp(0, 'RENDER_ENDPOS', 0, false),
+    srate    = gp(0, 'RENDER_SRATE', 0, false),
+    chans    = gp(0, 'RENDER_CHANNELS', 0, false),
+  }
+  local _, saved_file = gps(0, 'RENDER_FILE', '', false)
+  local _, saved_pat  = gps(0, 'RENDER_PATTERN', '', false)
+  local _, saved_fmt  = gps(0, 'RENDER_FORMAT', '', false)
+  local saved_solo = nil
+
+  local function restore()
+    gp(0, 'RENDER_SETTINGS', saved.settings, true)
+    gp(0, 'RENDER_BOUNDSFLAG', saved.bounds, true)
+    gp(0, 'RENDER_STARTPOS', saved.startpos, true)
+    gp(0, 'RENDER_ENDPOS', saved.endpos, true)
+    gp(0, 'RENDER_SRATE', saved.srate, true)
+    gp(0, 'RENDER_CHANNELS', saved.chans, true)
+    gps(0, 'RENDER_FILE', saved_file, true)
+    gps(0, 'RENDER_PATTERN', saved_pat, true)
+    gps(0, 'RENDER_FORMAT', saved_fmt, true)
+    if saved_solo then
+      for i, v in pairs(saved_solo) do
+        local tr = reaper.GetTrack(0, i)
+        if tr then reaper.SetMediaTrackInfo_Value(tr, 'I_SOLO', v) end
+      end
+    end
+  end
+
+  local tnum = source:match('^track:(%d+)$')
+  local rnum = source:match('^region:(%d+)$')
+
+  local ok, err = pcall(function()
+    -- common: single-file master mix, WAV, stereo, requested sample rate
+    gp(0, 'RENDER_SETTINGS', 0, true)
+    gp(0, 'RENDER_CHANNELS', 2, true)
+    gp(0, 'RENDER_SRATE', sample_rate, true)
+    gps(0, 'RENDER_FORMAT', 'evaw', true)   -- WAV, default bit depth
+    gps(0, 'RENDER_PATTERN', '', true)
+    gps(0, 'RENDER_FILE', out_path, true)
+
+    if source == 'master' then
+      gp(0, 'RENDER_BOUNDSFLAG', 1, true)               -- entire project
+    elseif source == 'time_selection' then
+      local s, e = reaper.GetSet_LoopTimeRange(false, false, 0, 0, false)
+      if e <= s then error('no time selection set (source="time_selection")') end
+      gp(0, 'RENDER_BOUNDSFLAG', 2, true)               -- time selection
+    elseif tnum then
+      local idx = tonumber(tnum)
+      if not reaper.GetTrack(0, idx) then
+        error('no track at index ' .. tostring(idx))
+      end
+      saved_solo = {}
+      for i = 0, reaper.CountTracks(0) - 1 do
+        local t = reaper.GetTrack(0, i)
+        saved_solo[i] = reaper.GetMediaTrackInfo_Value(t, 'I_SOLO')
+        reaper.SetMediaTrackInfo_Value(t, 'I_SOLO', i == idx and 1 or 0)
+      end
+      local s, e = reaper.GetSet_LoopTimeRange(false, false, 0, 0, false)
+      gp(0, 'RENDER_BOUNDSFLAG', (e > s) and 2 or 1, true)
+    elseif rnum then
+      local want, seen = tonumber(rnum), 0
+      local found, rs, re = false, 0, 0
+      local mi = 0
+      while true do
+        local retval, isrgn, pos, rgnend = reaper.EnumProjectMarkers(mi)
+        if retval == 0 then break end
+        if isrgn then
+          if seen == want then
+            found, rs, re = true, pos, rgnend
+            break
+          end
+          seen = seen + 1
+        end
+        mi = mi + 1
+      end
+      if not found then error('no region at index ' .. tostring(want)) end
+      gp(0, 'RENDER_BOUNDSFLAG', 0, true)               -- custom bounds
+      gp(0, 'RENDER_STARTPOS', rs, true)
+      gp(0, 'RENDER_ENDPOS', re, true)
+    else
+      error('unknown source: ' .. tostring(source))
+    end
+
+    reaper.Main_OnCommand(42230, 0)  -- render, auto-close dialog (synchronous)
+  end)
+
+  restore()
+  if not ok then error(tostring(err)) end
+  if not reaper.file_exists(out_path) then
+    error('render finished but output file not found: ' .. out_path)
+  end
+  return { ret = { path = out_path, source = source, sample_rate = sample_rate } }
+end
+
 ----------------------------------------------------------------------
 -- Dispatch
 ----------------------------------------------------------------------

@@ -82,6 +82,11 @@ High-level (think in beats; index = 0-based):
 `get_fx_params`, `set_fx_param`, `set_time_selection`, `add_marker`,
 `render_project`.
 
+Render to a known file (for analysis by another tool):
+- `render_to_wav` — render a single stereo WAV to a given path and get the
+  path back. `source` = `time_selection` (default) | `master` | `track:N`
+  (soloed through master) | `region:N`. Saves/restores your render settings.
+
 Escape hatches:
 - `reaper_call` — call any one of REAPER's 600+ ReaScript functions by name.
 - `run_lua` — execute an arbitrary Lua snippet inside REAPER (`return` a value).
