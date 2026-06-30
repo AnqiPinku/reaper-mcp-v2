@@ -540,7 +540,14 @@ function DSL.render_to_wav(out_path, source, sample_rate)
   sample_rate = sample_rate or 48000
   if not out_path:lower():match('%.wav$') then out_path = out_path .. '.wav' end
   local dir = out_path:match('^(.*)[/\\][^/\\]+$')
-  if dir then reaper.RecursiveCreateDirectory(dir, 0) end
+  if not dir then error('out_path must be an absolute path with a directory') end
+  reaper.RecursiveCreateDirectory(dir, 0)
+  -- REAPER needs RENDER_FILE=directory + RENDER_PATTERN=filename-stem (no ext).
+  -- A full path in RENDER_FILE with an empty pattern yields an EMPTY render
+  -- target (renders nothing). The real output path is read back from
+  -- RENDER_TARGETS after the settings are applied.
+  local stem = (out_path:match('[/\\]([^/\\]+)$')):gsub('%.[^.]+$', '')
+  local actual_path = out_path
 
   local gp, gps = reaper.GetSetProjectInfo, reaper.GetSetProjectInfo_String
   local saved = {
@@ -583,8 +590,8 @@ function DSL.render_to_wav(out_path, source, sample_rate)
     gp(0, 'RENDER_CHANNELS', 2, true)
     gp(0, 'RENDER_SRATE', sample_rate, true)
     gps(0, 'RENDER_FORMAT', 'evaw', true)   -- WAV, default bit depth
-    gps(0, 'RENDER_PATTERN', '', true)
-    gps(0, 'RENDER_FILE', out_path, true)
+    gps(0, 'RENDER_FILE', dir, true)
+    gps(0, 'RENDER_PATTERN', stem, true)
 
     if source == 'master' then
       gp(0, 'RENDER_BOUNDSFLAG', 1, true)               -- entire project
@@ -629,15 +636,21 @@ function DSL.render_to_wav(out_path, source, sample_rate)
       error('unknown source: ' .. tostring(source))
     end
 
+    local _, targets = gps(0, 'RENDER_TARGETS', '', false)
+    if targets and targets ~= '' then
+      actual_path = targets:match('^[^;]+') or out_path   -- first target file
+    end
+    os.remove(actual_path)  -- pre-delete: REAPER pops a blocking "overwrite?"
+                            -- modal if the target file already exists
     reaper.Main_OnCommand(42230, 0)  -- render, auto-close dialog (synchronous)
   end)
 
   restore()
   if not ok then error(tostring(err)) end
-  if not reaper.file_exists(out_path) then
-    error('render finished but output file not found: ' .. out_path)
+  if not reaper.file_exists(actual_path) then
+    error('render finished but output file not found: ' .. actual_path)
   end
-  return { ret = { path = out_path, source = source, sample_rate = sample_rate } }
+  return { ret = { path = actual_path, source = source, sample_rate = sample_rate } }
 end
 
 ----------------------------------------------------------------------
