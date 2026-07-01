@@ -279,6 +279,8 @@ local function time_to_beats(t)
   return fullbeats
 end
 
+local dispatch  -- forward decl; DSL.batch dispatches its sub-calls through it
+
 local DSL = {}
 
 function DSL.ping()
@@ -664,10 +666,24 @@ function DSL.render_to_wav(out_path, source, sample_rate)
   return { ret = { path = actual_path, source = source, sample_rate = sample_rate } }
 end
 
+-- batch(calls): run many ops in ONE round-trip. Each call mirrors a normal
+-- request -- {func=<name>, args={...}} or {func='run_lua', code='...'}. Results
+-- come back in order; one failing call does not abort the others, and handles
+-- minted by an earlier call are visible to a later one (same registry).
+function DSL.batch(calls)
+  local results = {}
+  for i = 1, #(calls or {}) do
+    local ok, r = pcall(dispatch, calls[i])
+    if ok then results[i] = r
+    else results[i] = { ok = false, error = tostring(r) } end
+  end
+  return { ret = results }
+end
+
 ----------------------------------------------------------------------
 -- Dispatch
 ----------------------------------------------------------------------
-local function dispatch(req)
+dispatch = function(req)
   local func = req.func
   if func == 'run_lua' then
     local chunk, cerr = load(req.code, 'mcp_run_lua', 't',

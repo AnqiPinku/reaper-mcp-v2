@@ -34,6 +34,12 @@ PROTOCOL_VERSION = "2024-11-05"
 SERVER_NAME = "reaper-mcp"
 SERVER_VERSION = "2.0.0"
 
+# A render is a synchronous, potentially minutes-long operation inside REAPER.
+# The normal per-call timeout (seconds) would make the server report a bogus
+# "timed out" while REAPER is still rendering happily, so render tools get
+# their own, much longer deadline.
+RENDER_TIMEOUT = float(os.environ.get("REAPER_MCP_RENDER_TIMEOUT", "300"))
+
 
 # --------------------------------------------------------------------------
 # Bridge IPC client
@@ -65,8 +71,13 @@ class Bridge:
         self.timeout = float(os.environ.get("REAPER_MCP_TIMEOUT", "10"))
         os.makedirs(self.dir, exist_ok=True)
 
-    def call(self, func: str, args=None, code: str = None) -> object:
-        """Send one request to the bridge and block for its response."""
+    def call(self, func: str, args=None, code: str = None,
+             timeout: float = None) -> object:
+        """Send one request to the bridge and block for its response.
+
+        `timeout` overrides the default per-call deadline; render tools pass a
+        long one because a bounce can legitimately run for minutes.
+        """
         rid = uuid.uuid4().hex[:12]
         payload = {"id": rid, "func": func}
         if code is not None:
@@ -84,7 +95,7 @@ class Bridge:
             json.dump(payload, f)
         os.replace(tmp, self.req)
 
-        deadline = time.time() + self.timeout
+        deadline = time.time() + (timeout if timeout is not None else self.timeout)
         while time.time() < deadline:
             if os.path.exists(self.resp):
                 try:
@@ -330,7 +341,7 @@ tool(
     "Render the project using its most recent render settings. Optionally "
     "override the output file path.",
     obj({"path": {"type": "string"}}),
-    lambda b, a: b.call("render_project", [a.get("path")]),
+    lambda b, a: b.call("render_project", [a.get("path")], timeout=RENDER_TIMEOUT),
 )
 
 tool(
@@ -349,7 +360,7 @@ tool(
         ["out_path"]),
     lambda b, a: b.call("render_to_wav",
                         [a["out_path"], a.get("source", "time_selection"),
-                         a.get("sample_rate", 48000)]),
+                         a.get("sample_rate", 48000)], timeout=RENDER_TIMEOUT),
 )
 
 tool(
@@ -373,6 +384,27 @@ tool(
     "round-trips.",
     obj({"code": {"type": "string"}}, ["code"]),
     lambda b, a: b.call("run_lua", code=a["code"]),
+)
+
+tool(
+    "batch",
+    "Run several operations in ONE round-trip instead of one MCP call each. "
+    "This amortizes the file-IPC latency (~1 REAPER frame per hop), so building "
+    "a 16-note drum pattern, or a whole 'add track + add FX + set params' "
+    "setup, costs a single hop rather than a dozen. 'calls' is an array; each "
+    "item is {\"func\": <name>, \"args\": [...]} where func is any tool/DSL or "
+    "ReaScript name (exactly like reaper_call), or {\"func\": \"run_lua\", "
+    "\"code\": \"...\"}. Handles returned by an earlier call in the SAME batch "
+    "can be passed into a later one. Returns an array of per-call results, each "
+    "{\"ok\": true, \"ret\": ...} or {\"ok\": false, \"error\": ...}; one "
+    "failing call does not abort the rest.",
+    obj({"calls": {"type": "array", "items": obj({
+        "func": {"type": "string"},
+        "args": {"type": "array"},
+        "code": {"type": "string"}},
+        ["func"])}},
+        ["calls"]),
+    lambda b, a: b.call("batch", [a["calls"]]),
 )
 
 
