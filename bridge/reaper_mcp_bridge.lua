@@ -468,6 +468,64 @@ function DSL.list_track_fx(ti)
   return { ret = fx }
 end
 
+-- list_fx_presets(track_index, fx_index, limit)
+-- 读名字要逐个切换预设（会短暂加载），重采样器慎用；读完恢复原预设。
+function DSL.list_fx_presets(ti, fxi, limit)
+  local t = track_at(ti)
+  local cur, count = reaper.TrackFX_GetPresetIndex(t, fxi)
+  limit = limit or 50
+  local names = {}
+  local n = count
+  if n > limit then n = limit end
+  for i = 0, n - 1 do
+    reaper.TrackFX_SetPresetByIndex(t, fxi, i)
+    local _, name = reaper.TrackFX_GetPreset(t, fxi, '')
+    names[#names + 1] = name
+  end
+  reaper.TrackFX_SetPresetByIndex(t, fxi, cur)
+  return { ret = { count = count, shown = #names, current_index = cur, presets = names } }
+end
+
+-- set_fx_preset(track_index, fx_index, preset)  preset = 名字|索引
+function DSL.set_fx_preset(ti, fxi, preset)
+  local t = track_at(ti)
+  local ok
+  if type(preset) == 'number' then
+    ok = reaper.TrackFX_SetPresetByIndex(t, fxi, preset)
+  else
+    ok = reaper.TrackFX_SetPreset(t, fxi, preset)
+  end
+  if not ok then error('preset not found: ' .. tostring(preset)) end
+  local _, name = reaper.TrackFX_GetPreset(t, fxi, '')
+  return { ret = { preset = name } }
+end
+
+-- list_installed_fx(filter, instruments_only, limit)
+-- 机器上装了哪些插件（配乐器前先查）。乐器 = 前缀以 i 结尾（VSTi/VST3i/CLAPi/AUi/LV2i）。
+function DSL.list_installed_fx(filter, instruments_only, limit)
+  if not reaper.EnumInstalledFX then
+    error('EnumInstalledFX unavailable -- needs REAPER >= 6.37')
+  end
+  filter = string.lower(filter or '')
+  limit = limit or 50
+  local out, total, i = {}, 0, 0
+  while true do
+    local ok, name = reaper.EnumInstalledFX(i)
+    if not ok then break end
+    i = i + 1
+    local prefix = string.match(name or '', '^(%w+):') or ''
+    local is_inst = string.sub(prefix, -1) == 'i'
+    if (not instruments_only or is_inst)
+        and (filter == '' or string.find(string.lower(name), filter, 1, true)) then
+      total = total + 1
+      if #out < limit then
+        out[#out + 1] = { name = name, instrument = is_inst }
+      end
+    end
+  end
+  return { ret = { total = total, shown = #out, fx = out } }
+end
+
 -- set_fx_param(track_index, fx_index, param, value)  param = index|name
 function DSL.set_fx_param(ti, fxi, param, value)
   local t = track_at(ti)

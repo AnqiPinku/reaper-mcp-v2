@@ -24,9 +24,11 @@ Environment:
   REAPER_MCP_TIMEOUT    Seconds to wait for a bridge response (default 10).
 """
 
+import glob
 import json
 import os
 import sys
+import tempfile
 import time
 import uuid
 
@@ -39,6 +41,24 @@ SERVER_VERSION = "2.0.0"
 # "timed out" while REAPER is still rendering happily, so render tools get
 # their own, much longer deadline.
 RENDER_TIMEOUT = float(os.environ.get("REAPER_MCP_RENDER_TIMEOUT", "300"))
+
+# Analysis renders land in one managed temp folder and get pruned on the next
+# render, so repeated listen/measure cycles never pile WAV files up anywhere.
+RENDERS_DIR = os.path.join(tempfile.gettempdir(), "prism-renders")
+RENDERS_KEEP = 8
+
+
+def default_render_path() -> str:
+    """Timestamped WAV path inside the managed folder; prunes old renders."""
+    os.makedirs(RENDERS_DIR, exist_ok=True)
+    old = sorted(glob.glob(os.path.join(RENDERS_DIR, "*.wav")), key=os.path.getmtime)
+    for p in old[:-(RENDERS_KEEP - 1)] if len(old) >= RENDERS_KEEP else []:
+        try:
+            os.remove(p)
+        except OSError:
+            pass
+    return os.path.join(
+        RENDERS_DIR, time.strftime("render-%Y%m%d-%H%M%S") + ".wav")
 
 
 # --------------------------------------------------------------------------
@@ -273,7 +293,11 @@ tool(
 tool(
     "add_track_fx",
     "Add an FX to a track by name (e.g. 'ReaEQ', 'ReaComp', 'VST3:Serum'). "
-    "Returns its fx_index.",
+    "Returns its fx_index. When picking an INSTRUMENT, first discover real "
+    "ones with list_installed_fx (instruments_only=true) -- Cockos ReaSynth/"
+    "ReaSynDr are bare test-grade synths that sound cheap; prefer the user's "
+    "installed instruments (samplers like Kontakt, real synths) whenever any "
+    "exist.",
     obj({"track_index": {"type": "integer", "minimum": 0},
          "fx_name": {"type": "string"}},
         ["track_index", "fx_name"]),
@@ -281,10 +305,54 @@ tool(
 )
 
 tool(
+    "list_fx_presets",
+    "List the preset names an FX exposes (up to 'limit', default 50) plus the "
+    "current one. WARNING: reading names steps through the presets, which "
+    "loads each briefly -- avoid on heavy samplers (e.g. Kontakt with big "
+    "libraries); fine for synths/ReaPlugs.",
+    obj({"track_index": {"type": "integer", "minimum": 0},
+         "fx_index": {"type": "integer", "minimum": 0},
+         "limit": {"type": "integer", "minimum": 1}},
+        ["track_index", "fx_index"]),
+    lambda b, a: b.call("list_fx_presets",
+                        [a["track_index"], a["fx_index"], a.get("limit", 50)]),
+)
+
+tool(
+    "set_fx_preset",
+    "Switch an FX to a named preset (string, exact name from list_fx_presets) "
+    "or preset index (integer). Note: Kontakt instrument libraries do NOT "
+    "load through this preset system -- the user picks those in Kontakt's own "
+    "window; this works for synths and plugins with normal preset lists.",
+    obj({"track_index": {"type": "integer", "minimum": 0},
+         "fx_index": {"type": "integer", "minimum": 0},
+         "preset": {"type": ["string", "integer"]}},
+        ["track_index", "fx_index", "preset"]),
+    lambda b, a: b.call("set_fx_preset",
+                        [a["track_index"], a["fx_index"], a["preset"]]),
+)
+
+tool(
     "list_track_fx",
     "List the FX on a track with index, name, enabled state and param count.",
     obj({"track_index": {"type": "integer", "minimum": 0}}, ["track_index"]),
     lambda b, a: b.call("list_track_fx", [a["track_index"]]),
+)
+
+tool(
+    "list_installed_fx",
+    "List FX plugins INSTALLED in this REAPER (needs REAPER >= 6.37). Use it "
+    "to discover what instruments/effects exist before add_track_fx -- pass "
+    "the returned name straight to add_track_fx. Optional case-insensitive "
+    "'filter' substring (e.g. 'kontakt', 'synth'); instruments_only limits to "
+    "virtual instruments (VSTi/VST3i/CLAPi...). Returns up to 'limit' entries "
+    "(default 50) plus the total match count.",
+    obj({"filter": {"type": "string"},
+         "instruments_only": {"type": "boolean"},
+         "limit": {"type": "integer", "minimum": 1}}),
+    lambda b, a: b.call("list_installed_fx",
+                        [a.get("filter", ""), a.get("instruments_only", False),
+                         a.get("limit", 50)]),
 )
 
 tool(
@@ -346,20 +414,23 @@ tool(
 
 tool(
     "render_to_wav",
-    "Render audio to a WAV file at a known path and return the absolute path "
-    "actually written -- the bridge from REAPER to audio analysis. source is "
-    "one of: 'time_selection' (master mix over the current time selection; the "
+    "Render audio to a WAV file and return the absolute path actually written "
+    "-- the bridge from REAPER to audio analysis. out_path is OPTIONAL: leave "
+    "it out for analysis renders and the file lands in a managed temp folder "
+    "that is auto-pruned (last %d kept), so nothing accumulates; only set it "
+    "when the user asked to export to a specific place. source is one of: "
+    "'time_selection' (master mix over the current time selection; the "
     "default), 'master' (whole-project master mix), 'track:N' (track N soloed "
     "through the master, 0-based), or 'region:N' (the N-th region, 0-based in "
     "time order). Output is stereo WAV at sample_rate (default 48000). The "
     "project's own render settings (and solo state for 'track:N') are saved "
-    "and restored, so this leaves the render dialog untouched.",
+    "and restored, so this leaves the render dialog untouched." % RENDERS_KEEP,
     obj({"out_path": {"type": "string"},
          "source": {"type": "string"},
-         "sample_rate": {"type": "integer", "minimum": 8000}},
-        ["out_path"]),
+         "sample_rate": {"type": "integer", "minimum": 8000}}),
     lambda b, a: b.call("render_to_wav",
-                        [a["out_path"], a.get("source", "time_selection"),
+                        [a.get("out_path") or default_render_path(),
+                         a.get("source", "time_selection"),
                          a.get("sample_rate", 48000)], timeout=RENDER_TIMEOUT),
 )
 
