@@ -1,24 +1,30 @@
 #!/usr/bin/env python3
 """One-click bridge installer + live status probe (zero-dependency, stdlib only).
 
-Replaces the manual "Actions > Load ReaScript > Run" ritual:
-  1. resolve REAPER's per-user resource path (portable-aware, with manual override)
-  2. copy bridge/reaper_mcp_bridge.lua into <resource>/Scripts/ + a .version stamp
-  3. idempotently register auto-run via <resource>/Scripts/__startup.lua
-     (MERGE a sentinel-delimited block, never clobber the user's own startup file)
-  4. purge known-stale leftovers from older manual installs
-Plus status(): is REAPER running? is a bridge answering ping? is our copy current?
+Replaces the manual "Actions > Load ReaScript > Run" ritual with a `__startup.lua`
+that REAPER auto-runs at launch.
 
-Lives in reaper-mcp (it owns the bridge). The desktop gateway imports it by file
-path via ${PRISM_HOME}/reaper-mcp/installer/install_bridge.py.
+Three hard-won correctness points (all learned the hard way on a real machine):
+  1. REAPER's resource path is NOT always %APPDATA%/REAPER. Portable installs put
+     it next to the exe (often a non-ASCII path, e.g. A:\\科广\\Reaper). Install into
+     the resource path of the *actual running* REAPER — ask it via GetResourcePath()
+     through a loaded bridge. Fallbacks: a saved path, a manual override, the default.
+  2. REAPER itself loads __startup.lua fine even from a non-ASCII resource path
+     (it's Unicode-aware), BUT Lua's own dofile/io can fail to open some paths —
+     non-ASCII ones, and (observed) files under a OneDrive-redirected %APPDATA%.
+     So __startup.lua must `dofile` the bridge from a plain ASCII, non-redirected
+     location. We point it straight at the shipped bridge (BRIDGE_SRC, ASCII app
+     path) rather than copying into %APPDATA% (which failed on the test machine).
+  3. Embed the dofile target as an absolute forward-slash path.
 
+Lives in reaper-mcp (it owns the bridge). The desktop gateway imports it by path.
 CLI:  python install_bridge.py status | install [--resource DIR] | uninstall
 """
 import hashlib
 import importlib.util
 import json
 import os
-import shutil
+import re
 import subprocess
 import sys
 import time
@@ -27,35 +33,67 @@ HERE = os.path.dirname(os.path.abspath(__file__))                 # .../reaper-m
 BRIDGE_SRC = os.path.normpath(os.path.join(HERE, "..", "bridge", "reaper_mcp_bridge.lua"))
 SERVER_SRC = os.path.normpath(os.path.join(HERE, "..", "server", "reaper_mcp_server.py"))
 
-BRIDGE_NAME = "reaper_mcp_bridge.lua"
-STAMP_NAME = ".reaper_mcp_bridge.version"
 STARTUP_NAME = "__startup.lua"
 BEGIN = "-- >>> reaper-mcp-bridge (managed) >>>"
 END = "-- <<< reaper-mcp-bridge (managed) <<<"
 
 
 # --------------------------------------------------------------------------
-# Resource-path resolution
+# Paths
 # --------------------------------------------------------------------------
+def _lua_path(p):
+    """Absolute path with forward slashes — safe to embed in a Lua string."""
+    return os.path.abspath(p).replace("\\", "/")
+
+
+def _appdata_base():
+    return (os.environ.get("APPDATA") or os.environ.get("XDG_DATA_HOME")
+            or os.path.expanduser("~/.local/share"))
+
+
+def _state_path():
+    return os.path.join(_appdata_base(), "reaper-mcp", "install_state.json")
+
+
 def default_resource_path():
-    """Per-OS REAPER resource dir (holds Scripts/, __startup.lua, REAPER.ini).
-    Portable installs keep it next to reaper.exe instead — pass a manual override."""
+    """Fallback only — wrong for portable installs. Prefer detect_resource_path()."""
     if os.name == "nt":
         base = os.environ.get("APPDATA")
         return os.path.join(base, "REAPER") if base else None
     home = os.path.expanduser("~")
     mac = os.path.join(home, "Library", "Application Support", "REAPER")
-    if os.path.isdir(mac):
-        return mac
-    return os.path.join(home, ".config", "REAPER")
+    return mac if os.path.isdir(mac) else os.path.join(home, ".config", "REAPER")
 
 
-def resolve_resource_path(override=None):
-    return os.path.abspath(override) if override else default_resource_path()
+# --------------------------------------------------------------------------
+# Resolve REAPER's REAL resource path (portable-safe)
+# --------------------------------------------------------------------------
+def detect_resource_path():
+    """Authoritative: ask the running REAPER via a loaded bridge. None if not loaded."""
+    try:
+        b = _server().Bridge()
+        b.timeout = 1.5
+        rp = b.call("GetResourcePath")
+        return rp if isinstance(rp, str) and rp else None
+    except Exception:      # noqa: BLE001 bridge not loaded / timeout
+        return None
 
 
-def _scripts_dir(resource):
-    return os.path.join(resource, "Scripts") if resource else None
+def _saved_resource_path():
+    try:
+        return json.loads(_read(_state_path())).get("resource_path")
+    except (ValueError, AttributeError):
+        return None
+
+
+def resolve_resource_path(override=None, loaded=None):
+    if override:
+        return os.path.abspath(override)
+    if loaded:
+        rp = detect_resource_path()
+        if rp:
+            return rp
+    return _saved_resource_path() or default_resource_path()
 
 
 # --------------------------------------------------------------------------
@@ -68,15 +106,6 @@ def _sha1(path):
     return h.hexdigest()
 
 
-def _startup_block():
-    return (BEGIN + "\n"
-            "local ok, err = pcall(dofile, reaper.GetResourcePath() .. "
-            "'/Scripts/" + BRIDGE_NAME + "')\n"
-            "if not ok then reaper.ShowConsoleMsg('reaper-mcp bridge autoload "
-            "failed: ' .. tostring(err) .. '\\n') end\n"
-            + END + "\n")
-
-
 def _read(path):
     try:
         with open(path, "r", encoding="utf-8", errors="replace") as f:
@@ -85,51 +114,52 @@ def _read(path):
         return ""
 
 
+def _startup_block(bridge_lua_path):
+    return (BEGIN + "\n"
+            "-- Auto-loads the reaper-mcp bridge at REAPER startup. Managed by install_bridge.py.\n"
+            "local ok, err = pcall(dofile, '" + bridge_lua_path + "')\n"
+            "if not ok then reaper.ShowConsoleMsg('reaper-mcp bridge autoload failed: ' "
+            ".. tostring(err)) end\n"
+            + END + "\n")
+
+
 def _startup_registered(scripts):
     txt = _read(os.path.join(scripts, STARTUP_NAME)) if scripts else ""
     return BEGIN in txt and END in txt
 
 
-def _register_startup(scripts):
-    """Write our sentinel-delimited autoload block into __startup.lua.
-    Create if absent; replace ONLY our block if present; preserve all foreign lines."""
+def _embedded_bridge_path(scripts):
+    """The bridge path our managed __startup block currently dofiles (or None)."""
+    txt = _read(os.path.join(scripts, STARTUP_NAME)) if scripts else ""
+    if BEGIN not in txt:
+        return None
+    m = re.search(r"pcall\(dofile,\s*'([^']+)'\)", txt)
+    return m.group(1) if m else None
+
+
+def _register_startup(scripts, bridge_lua_path):
+    """Write our sentinel block into <scripts>/__startup.lua. Create if absent;
+    replace ONLY our block if present; preserve all foreign lines. Python writes
+    Unicode paths fine even when <scripts> is non-ASCII."""
     path = os.path.join(scripts, STARTUP_NAME)
-    block = _startup_block()
+    block = _startup_block(bridge_lua_path)
     existing = _read(path)
     if BEGIN in existing and END in existing:
         pre = existing[:existing.index(BEGIN)]
         post = existing[existing.index(END) + len(END):].lstrip("\r\n")
         new = pre + block + post
     elif existing:
-        sep = "" if existing.endswith("\n") else "\n"
-        new = existing + sep + block
+        new = existing + ("" if existing.endswith("\n") else "\n") + block
     else:
         new = block
-    with open(path, "w", encoding="utf-8") as f:
+    with open(path, "w", encoding="utf-8", newline="\n") as f:
         f.write(new)
 
 
-def _purge_stale(scripts):
-    """Remove leftovers from older bridge installs that can double-load or confuse.
-    The stale reaper_mcp_bridge.lua itself is overwritten by the copy (reported
-    separately as 'replaced'); here we drop the old Scripts/mcp_bridge_data dir
-    (an earlier bridge's data dir; the current bridge uses %APPDATA%/reaper-mcp-ipc)."""
-    purged = []
-    data_dir = os.path.join(scripts, "mcp_bridge_data")
-    if os.path.isdir(data_dir):
-        try:
-            shutil.rmtree(data_dir)
-            purged.append("mcp_bridge_data/")
-        except OSError:
-            pass
-    return purged
-
-
 # --------------------------------------------------------------------------
-# Live status: REAPER running? bridge answering? installed copy current?
+# Live status
 # --------------------------------------------------------------------------
 def _reaper_running():
-    """Best-effort process check. None if undeterminable (never assume)."""
     try:
         if os.name == "nt":
             flags = getattr(subprocess, "CREATE_NO_WINDOW", 0x08000000)
@@ -139,7 +169,7 @@ def _reaper_running():
         out = subprocess.run(["pgrep", "-i", "reaper"], capture_output=True,
                              text=True, timeout=6)
         return out.returncode == 0
-    except Exception:      # noqa: BLE001 no tasklist/pgrep, timeout, etc.
+    except Exception:      # noqa: BLE001
         return None
 
 
@@ -147,7 +177,6 @@ _SERVER_MOD = None
 
 
 def _server():
-    """Load reaper_mcp_server as a module (for its Bridge = single source of IPC truth)."""
     global _SERVER_MOD
     if _SERVER_MOD is None and os.path.isfile(SERVER_SRC):
         spec = importlib.util.spec_from_file_location("reaper_mcp_server_installer", SERVER_SRC)
@@ -158,7 +187,6 @@ def _server():
 
 
 def _bridge_ping(timeout=1.5):
-    """True iff a loaded bridge answers ping within timeout (short — the UI polls)."""
     srv = _server()
     if not srv:
         return False
@@ -166,35 +194,28 @@ def _bridge_ping(timeout=1.5):
         b = srv.Bridge()
         b.timeout = float(timeout)
         return b.call("ping") == "pong"
-    except Exception:      # noqa: BLE001 BridgeError timeout => not loaded
+    except Exception:      # noqa: BLE001
         return False
 
 
 def status(resource=None, ping_timeout=1.5):
-    resource = resolve_resource_path(resource)
-    scripts = _scripts_dir(resource)
-    installed = bool(scripts and os.path.isfile(os.path.join(scripts, BRIDGE_NAME)))
-    current = False
-    if installed:
-        want = _sha1(BRIDGE_SRC) if os.path.isfile(BRIDGE_SRC) else None
-        have = None
-        try:
-            have = json.loads(_read(os.path.join(scripts, STAMP_NAME))).get("sha1")
-        except (ValueError, AttributeError):
-            pass
-        current = bool(want and have == want)
     loaded = _bridge_ping(ping_timeout)
-    running = True if loaded else _reaper_running()   # a pong proves it's running
+    rp = resolve_resource_path(resource, loaded=loaded)
+    scripts = os.path.join(rp, "Scripts") if rp else None
+    installed = _startup_registered(scripts) if scripts else False
+    # current = our block points at THIS build's bridge (stale if the app moved)
+    current = installed and _embedded_bridge_path(scripts) == _lua_path(BRIDGE_SRC)
+    running = True if loaded else _reaper_running()
     state = ("connected" if loaded
              else "running_not_loaded" if running
              else "not_running" if running is False
-             else "not_loaded")                        # running unknown, no pong
+             else "not_loaded")
     return {
-        "resource_path": resource,
-        "resource_exists": bool(resource and os.path.isdir(resource)),
+        "resource_path": rp,
+        "resource_exists": bool(rp and os.path.isdir(rp)),
+        "resource_detected": bool(loaded),   # True => path came straight from REAPER
         "installed": installed,
-        "installed_current": current,
-        "autorun_registered": _startup_registered(scripts) if scripts else False,
+        "installed_current": bool(current),
         "reaper_running": running,
         "bridge_loaded": loaded,
         "state": state,
@@ -204,64 +225,60 @@ def status(resource=None, ping_timeout=1.5):
 # --------------------------------------------------------------------------
 # Install / uninstall
 # --------------------------------------------------------------------------
-def install(resource=None):
-    resource = resolve_resource_path(resource)
-    if not resource:
-        return {"ok": False, "error": "无法定位 REAPER 资源目录，请手动指定路径。"}
-    if not os.path.isdir(resource):
-        return {"ok": False,
-                "error": "REAPER 资源目录不存在：%s（REAPER 装了吗？便携版请手动指定）" % resource}
-    if not os.path.isfile(BRIDGE_SRC):
-        return {"ok": False, "error": "找不到 bridge 源文件：%s" % BRIDGE_SRC}
+def install(resource=None, bridge_src=None):
+    bridge_src = bridge_src or BRIDGE_SRC
+    if not os.path.isfile(bridge_src):
+        return {"ok": False, "error": "找不到 bridge 源文件：%s" % bridge_src}
 
-    scripts = _scripts_dir(resource)
+    loaded = _bridge_ping(1.5)
+    resource = resolve_resource_path(resource, loaded=loaded)
+    if not resource or not os.path.isdir(resource):
+        return {"ok": False, "error":
+                "无法定位 REAPER 资源目录（便携版？请先在 REAPER 里手动加载一次桥让我读到真实路径，"
+                "或手动指定路径）。当前尝试：%s" % resource}
+
+    scripts = os.path.join(resource, "Scripts")
     os.makedirs(scripts, exist_ok=True)
-    actions = []
+    bridge_lua = _lua_path(bridge_src)          # dofile the shipped bridge in place (ASCII)
+    _register_startup(scripts, bridge_lua)
 
-    dst = os.path.join(scripts, BRIDGE_NAME)
-    src_sha = _sha1(BRIDGE_SRC)
-    replaced = os.path.isfile(dst) and _sha1(dst) != src_sha
-    shutil.copy2(BRIDGE_SRC, dst)
-    with open(os.path.join(scripts, STAMP_NAME), "w", encoding="utf-8") as f:
-        json.dump({"sha1": src_sha,
-                   "installed_at": time.strftime("%Y-%m-%d %H:%M:%S"),
-                   "source": os.path.abspath(BRIDGE_SRC)}, f, ensure_ascii=False)
-    actions.append(("替换旧桥并更新 " if replaced else "拷贝 ") + BRIDGE_NAME)
+    try:                                        # persist for status() when bridge isn't loaded
+        os.makedirs(os.path.dirname(_state_path()), exist_ok=True)
+        with open(_state_path(), "w", encoding="utf-8") as f:
+            json.dump({"resource_path": resource, "bridge_path": bridge_lua,
+                       "bridge_sha": _sha1(bridge_src), "resource_detected": bool(loaded),
+                       "installed_at": time.strftime("%Y-%m-%d %H:%M:%S")}, f, ensure_ascii=False)
+    except OSError:
+        pass
 
-    for p in _purge_stale(scripts):
-        actions.append("清理 " + p)
-
-    _register_startup(scripts)
-    actions.append("注册 __startup.lua 自动加载")
-
-    return {"ok": True, "resource_path": resource, "actions": actions,
+    return {"ok": True, "resource_path": resource, "bridge_path": bridge_lua,
+            "resource_detected": bool(loaded),
+            "actions": ["在资源目录注册 __startup.lua 自动加载：%s" % resource,
+                        "自动加载指向 %s" % bridge_lua],
             "restart_required": True, "status": status(resource)}
 
 
 def uninstall(resource=None):
-    resource = resolve_resource_path(resource)
-    scripts = _scripts_dir(resource)
-    if not scripts:
-        return {"ok": False, "error": "无法定位 REAPER 资源目录。"}
+    loaded = _bridge_ping(1.0)
+    resource = resolve_resource_path(resource, loaded=loaded)
     removed = []
-    for name in (BRIDGE_NAME, STAMP_NAME):
-        p = os.path.join(scripts, name)
-        if os.path.isfile(p):
-            try:
-                os.remove(p)
-                removed.append(name)
-            except OSError:
-                pass
-    sp = os.path.join(scripts, STARTUP_NAME)
-    txt = _read(sp)
-    if BEGIN in txt and END in txt:
-        new = (txt[:txt.index(BEGIN)] + txt[txt.index(END) + len(END):]).strip("\r\n")
-        if new.strip():
-            with open(sp, "w", encoding="utf-8") as f:
-                f.write(new + "\n")
-        else:
-            os.remove(sp)                    # only our block was in it
-        removed.append("__startup.lua block")
+    if resource:
+        sp = os.path.join(resource, "Scripts", STARTUP_NAME)
+        txt = _read(sp)
+        if BEGIN in txt and END in txt:
+            new = (txt[:txt.index(BEGIN)] + txt[txt.index(END) + len(END):]).strip("\r\n")
+            if new.strip():
+                with open(sp, "w", encoding="utf-8", newline="\n") as f:
+                    f.write(new + "\n")
+            else:
+                os.remove(sp)
+            removed.append("__startup.lua block")
+    if os.path.isfile(_state_path()):
+        try:
+            os.remove(_state_path())
+            removed.append("install_state.json")
+        except OSError:
+            pass
     return {"ok": True, "removed": removed}
 
 
@@ -271,15 +288,8 @@ def uninstall(resource=None):
 def main(argv=None):
     argv = argv if argv is not None else sys.argv[1:]
     cmd = argv[0] if argv else "status"
-    override = None
-    if "--resource" in argv:
-        override = argv[argv.index("--resource") + 1]
-    if cmd == "install":
-        out = install(override)
-    elif cmd == "uninstall":
-        out = uninstall(override)
-    else:
-        out = status(override)
+    override = argv[argv.index("--resource") + 1] if "--resource" in argv else None
+    out = {"install": install, "uninstall": uninstall}.get(cmd, lambda r=None: status(r))(override)
     print(json.dumps(out, ensure_ascii=False, indent=2))
 
 
