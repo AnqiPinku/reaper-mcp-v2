@@ -21,7 +21,6 @@
 ]]--
 
 local DEBUG = false
-local POLL  = 0.03 -- seconds between polls (defer is frame-bound anyway)
 
 -- IPC directory: a FIXED, ASCII-only path under %APPDATA% so a Chinese (or any
 -- non-ASCII) install/project path can never corrupt the file channel. The
@@ -69,6 +68,15 @@ do
     return n == #t
   end
 
+  -- A table tagged by json.object(...) always encodes as a JSON object, even
+  -- when empty. Without this, an empty table is ambiguous and falls to the
+  -- is_array() default of '[]'; the tag is the opt-out for the rare code path
+  -- (e.g. a run_lua snippet) that must return '{}'.
+  local function forced_object(t)
+    local mt = getmetatable(t)
+    return mt ~= nil and mt.__jsontype == 'object'
+  end
+
   -- marshal_ret hook is set later so userdata becomes a handle.
   json.userdata_hook = function(_) return nil end
 
@@ -90,7 +98,7 @@ do
       if seen[v] then return 'null' end
       seen[v] = true
       local out
-      if is_array(v) then
+      if is_array(v) and not forced_object(v) then
         local parts = {}
         for i = 1, #v do parts[i] = encode(v[i], seen) end
         out = '[' .. table.concat(parts, ',') .. ']'
@@ -108,6 +116,9 @@ do
     end
   end
   json.encode = function(v) return encode(v, nil) end
+  -- Wrap a table so it always serializes as a JSON object ({}), never []. It is
+  -- injected into the run_lua sandbox, so a snippet can `return json.object{}`.
+  json.object = function(t) return setmetatable(t or {}, { __jsontype = 'object' }) end
 
   -- decoder
   local function decode(s, i)
