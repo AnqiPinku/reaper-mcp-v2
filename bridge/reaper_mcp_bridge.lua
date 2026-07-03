@@ -470,8 +470,19 @@ end
 
 -- list_fx_presets(track_index, fx_index, limit)
 -- 读名字要逐个切换预设（会短暂加载），重采样器慎用；读完恢复原预设。
+-- 硬闸门：像 Kontakt 这种超大采样器,每次切换预设都会加载 0.5-2 秒的库,
+-- 默认 limit=50 会让 REAPER 挂死 25-100 秒,超过桥 10 秒超时。不放行。
 function DSL.list_fx_presets(ti, fxi, limit)
   local t = track_at(ti)
+  local _, fx_name = reaper.TrackFX_GetFXName(t, fxi, '')
+  local lower = string.lower(fx_name or '')
+  if string.find(lower, 'kontakt', 1, true)
+      or string.find(lower, 'omnisphere', 1, true)
+      or string.find(lower, 'sampletank', 1, true)
+      or string.find(lower, 'play', 1, true) and string.find(lower, 'east west', 1, true) then
+    error('拒绝在重采样器上列举预设("' .. (fx_name or '') .. '"):每个预设需加载音色库,'
+          .. '会让 REAPER 卡死几十秒。请让用户在插件窗口内手动选。')
+  end
   local cur, count = reaper.TrackFX_GetPresetIndex(t, fxi)
   limit = limit or 50
   local names = {}
