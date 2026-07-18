@@ -262,20 +262,33 @@ tool(
         a["track_index"], a.get("start_beats", 0), a.get("length_beats", 4)]),
 )
 
+# add_midi_notes / replace_midi_notes 共用的 note 格式。刻意不设
+# additionalProperties:false —— get_midi_notes 的输出（多出 index/selected 字段）
+# 可以原样回灌，桥端忽略未知字段、保留 muted。
+NOTE_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "pitch": {"type": "integer", "minimum": 0, "maximum": 127},
+        "start_beats": {"type": "number"},
+        "length_beats": {"type": "number"},
+        "velocity": {"type": "integer", "minimum": 1, "maximum": 127},
+        "channel": {"type": "integer", "minimum": 0, "maximum": 15},
+        "muted": {"type": "boolean"},
+    },
+    "required": ["pitch", "start_beats"],
+}
+
 tool(
     "add_midi_notes",
-    "Add MIDI notes to an existing MIDI item. Each note: {pitch (0-127, "
-    "60=middle C), start_beats (absolute, from project start), length_beats, "
-    "velocity (1-127, default 96), channel (0-15, default 0)}.",
+    "APPEND MIDI notes to an existing MIDI item -- existing notes are kept "
+    "as-is. To rewrite or correct existing notes use replace_midi_notes / "
+    "update_midi_note instead (appending corrected copies duplicates notes). "
+    "Each note: {pitch (0-127, 60=middle C), start_beats (absolute, from "
+    "project start), length_beats, velocity (1-127, default 96), channel "
+    "(0-15, default 0), muted (default false)}.",
     obj({"track_index": {"type": "integer", "minimum": 0},
          "item_index": {"type": "integer", "minimum": 0},
-         "notes": {"type": "array", "items": obj({
-             "pitch": {"type": "integer", "minimum": 0, "maximum": 127},
-             "start_beats": {"type": "number"},
-             "length_beats": {"type": "number"},
-             "velocity": {"type": "integer", "minimum": 1, "maximum": 127},
-             "channel": {"type": "integer", "minimum": 0, "maximum": 15},
-         }, ["pitch", "start_beats"])}},
+         "notes": {"type": "array", "items": NOTE_SCHEMA}},
         ["track_index", "item_index", "notes"]),
     lambda b, a: b.call("add_midi_notes",
                         [a["track_index"], a["item_index"], a["notes"]]),
@@ -288,6 +301,65 @@ tool(
          "item_index": {"type": "integer", "minimum": 0}},
         ["track_index", "item_index"]),
     lambda b, a: b.call("get_midi_notes", [a["track_index"], a["item_index"]]),
+)
+
+tool(
+    "update_midi_note",
+    "Modify ONE existing note in place, identified by its note index from "
+    "get_midi_notes. Only the provided fields change (pitch, start_beats, "
+    "length_beats, velocity, channel, muted); everything else is preserved. "
+    "Single REAPER undo step. Returns before/after summaries. CAUTION: notes "
+    "re-sort by time after the edit, so indices may shift -- re-read "
+    "get_midi_notes before further index-based edits.",
+    obj({"track_index": {"type": "integer", "minimum": 0},
+         "item_index": {"type": "integer", "minimum": 0},
+         "note_index": {"type": "integer", "minimum": 0},
+         "pitch": {"type": "integer", "minimum": 0, "maximum": 127},
+         "start_beats": {"type": "number"},
+         "length_beats": {"type": "number"},
+         "velocity": {"type": "integer", "minimum": 1, "maximum": 127},
+         "channel": {"type": "integer", "minimum": 0, "maximum": 15},
+         "muted": {"type": "boolean"}},
+        ["track_index", "item_index", "note_index"]),
+    lambda b, a: b.call("update_midi_note", [
+        a["track_index"], a["item_index"], a["note_index"],
+        {k: a[k] for k in ("pitch", "start_beats", "length_beats",
+                           "velocity", "channel", "muted") if k in a}]),
+)
+
+tool(
+    "delete_midi_notes",
+    "Delete specific notes by their indices from get_midi_notes. "
+    "DESTRUCTIVE but undoable: all deletions happen in ONE undo step, and "
+    "the response includes snapshots of every deleted note plus before/after "
+    "counts. Indices are resolved against the CURRENT note order -- always "
+    "call get_midi_notes right before this.",
+    obj({"track_index": {"type": "integer", "minimum": 0},
+         "item_index": {"type": "integer", "minimum": 0},
+         "note_indices": {"type": "array",
+                          "items": {"type": "integer", "minimum": 0},
+                          "minItems": 1}},
+        ["track_index", "item_index", "note_indices"]),
+    lambda b, a: b.call("delete_midi_notes",
+                        [a["track_index"], a["item_index"], a["note_indices"]]),
+)
+
+tool(
+    "replace_midi_notes",
+    "Atomically REPLACE the entire note content of an item's active take: "
+    "deletes every existing note and inserts the provided set, all in ONE "
+    "undo step. Use this (not add_midi_notes, which only APPENDS and would "
+    "duplicate notes) for pitch correction and bulk rewrites. You may feed "
+    "get_midi_notes output straight back in (extra fields like index/"
+    "selected are ignored; muted is preserved). Refuses an empty set -- to "
+    "wipe an item use delete_midi_notes with all indices. Returns removed/"
+    "inserted counts.",
+    obj({"track_index": {"type": "integer", "minimum": 0},
+         "item_index": {"type": "integer", "minimum": 0},
+         "notes": {"type": "array", "items": NOTE_SCHEMA, "minItems": 1}},
+        ["track_index", "item_index", "notes"]),
+    lambda b, a: b.call("replace_midi_notes",
+                        [a["track_index"], a["item_index"], a["notes"]]),
 )
 
 tool(

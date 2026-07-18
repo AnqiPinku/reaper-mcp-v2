@@ -146,6 +146,37 @@ def main():
                        "params": {"name": "nope", "arguments": {}}})
         check("unknown tool errors", "error" in r)
 
+        r = rpc(proc, {"jsonrpc": "2.0", "id": 10, "method": "tools/call",
+                       "params": {"name": "update_midi_note",
+                                  "arguments": {"track_index": 1, "item_index": 0,
+                                                "note_index": 4, "pitch": 60,
+                                                "velocity": 80}}})
+        body = json.loads(r["result"]["content"][0]["text"])
+        check("update_midi_note sends index + only provided changes",
+              body["args"][:3] == [1, 0, 4]
+              and body["args"][3] == {"pitch": 60, "velocity": 80})
+
+        r = rpc(proc, {"jsonrpc": "2.0", "id": 11, "method": "tools/call",
+                       "params": {"name": "delete_midi_notes",
+                                  "arguments": {"track_index": 1, "item_index": 0,
+                                                "note_indices": [5, 2, 9]}}})
+        body = json.loads(r["result"]["content"][0]["text"])
+        check("delete_midi_notes passes indices positionally",
+              body["args"] == [1, 0, [5, 2, 9]])
+
+        r = rpc(proc, {"jsonrpc": "2.0", "id": 12, "method": "tools/call",
+                       "params": {"name": "replace_midi_notes",
+                                  "arguments": {"track_index": 1, "item_index": 0,
+                                                "notes": [{"pitch": 62,
+                                                           "start_beats": 0,
+                                                           "length_beats": 1,
+                                                           "muted": True}]}}})
+        body = json.loads(r["result"]["content"][0]["text"])
+        check("replace_midi_notes passes the full note set incl. muted",
+              body["args"][:2] == [1, 0]
+              and body["args"][2][0]["pitch"] == 62
+              and body["args"][2][0]["muted"] is True)
+
         r = rpc(proc, {"jsonrpc": "2.0", "id": 9, "method": "tools/call",
                        "params": {"name": "batch",
                                   "arguments": {"calls": [

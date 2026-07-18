@@ -400,14 +400,44 @@ function DSL.create_midi_item(ti, start_beats, length_beats)
                    length_beats = length_beats or 4 } }
 end
 
--- add_midi_notes(track_index, item_index, notes[])
---   note = {pitch, start_beats, length_beats, velocity=96, channel=0}
-function DSL.add_midi_notes(ti, ii, notes)
+-- MIDI 工具共用 helper：取 MIDI take / 单音符快照 / 音符集合前置校验。
+-- 校验必须发生在任何变更（尤其 undo 块）之前：块内失败会让 EndBlock 悬空、
+-- 撤销历史被污染，replace 场景还会造成"删完旧的、新的插一半"的数据丢失。
+local function midi_take_at(ti, ii)
   local t = track_at(ti)
   local item = reaper.GetTrackMediaItem(t, ii)
   if not item then error('no item at index ' .. tostring(ii)) end
   local take = reaper.GetActiveTake(item)
   if not take or not reaper.TakeIsMIDI(take) then error('item take is not MIDI') end
+  return take
+end
+
+local function note_snapshot(take, i)
+  local _, _, muted, sppq, eppq, chan, pitch, vel = reaper.MIDI_GetNote(take, i)
+  local sqn = reaper.MIDI_GetProjQNFromPPQPos(take, sppq)
+  local eqn = reaper.MIDI_GetProjQNFromPPQPos(take, eppq)
+  return { index = i, pitch = pitch, velocity = vel, channel = chan,
+           muted = muted, start_beats = sqn, length_beats = eqn - sqn }
+end
+
+local function validate_notes(notes)
+  for i, nt in ipairs(notes or {}) do
+    if type(nt) ~= 'table' or type(nt.pitch) ~= 'number'
+        or type(nt.start_beats) ~= 'number' then
+      error('note #' .. i .. ' must have numeric pitch and start_beats')
+    end
+    for _, k in ipairs({ 'length_beats', 'velocity', 'channel' }) do
+      if nt[k] ~= nil and type(nt[k]) ~= 'number' then
+        error('note #' .. i .. ' field ' .. k .. ' must be a number')
+      end
+    end
+    if nt.muted ~= nil and type(nt.muted) ~= 'boolean' then
+      error('note #' .. i .. ' field muted must be a boolean')
+    end
+  end
+end
+
+local function insert_notes(take, notes)
   local count = 0
   for _, nt in ipairs(notes or {}) do
     -- start_beats / length_beats are absolute project quarter-notes
@@ -415,10 +445,20 @@ function DSL.add_midi_notes(ti, ii, notes)
     local end_qn = nt.start_beats + (nt.length_beats or 1)
     local sppq = reaper.MIDI_GetPPQPosFromProjQN(take, start_qn)
     local eppq = reaper.MIDI_GetPPQPosFromProjQN(take, end_qn)
-    reaper.MIDI_InsertNote(take, false, false, sppq, eppq,
+    reaper.MIDI_InsertNote(take, false, nt.muted == true, sppq, eppq,
       nt.channel or 0, nt.pitch, nt.velocity or 96, true)
     count = count + 1
   end
+  return count
+end
+
+-- add_midi_notes(track_index, item_index, notes[])
+--   note = {pitch, start_beats, length_beats, velocity=96, channel=0, muted=false}
+--   纯追加；重写/修正现有音符用 replace_midi_notes / update_midi_note。
+function DSL.add_midi_notes(ti, ii, notes)
+  local take = midi_take_at(ti, ii)
+  validate_notes(notes)
+  local count = insert_notes(take, notes)
   reaper.MIDI_Sort(take)
   reaper.UpdateArrange()
   return { ret = { inserted = count } }
@@ -443,6 +483,95 @@ function DSL.get_midi_notes(ti, ii)
     }
   end
   return { ret = notes }
+end
+
+-- update_midi_note(track_index, item_index, note_index, changes)
+--   只改 changes 里给出的字段；单个 undo 块；改动后 REAPER 重新按时间排序,
+--   索引可能位移,继续按索引编辑前必须重新 get_midi_notes。
+function DSL.update_midi_note(ti, ii, note_index, changes)
+  local take = midi_take_at(ti, ii)
+  local _, noteCount = reaper.MIDI_CountEvts(take)
+  if type(note_index) ~= 'number' or note_index % 1 ~= 0
+      or note_index < 0 or note_index >= noteCount then
+    error('no note at index ' .. tostring(note_index) .. ' (count ' .. tostring(noteCount) .. ')')
+  end
+  local ch = changes or {}
+  for _, k in ipairs({ 'pitch', 'start_beats', 'length_beats', 'velocity', 'channel' }) do
+    if ch[k] ~= nil and type(ch[k]) ~= 'number' then
+      error('field ' .. k .. ' must be a number')
+    end
+  end
+  if ch.muted ~= nil and type(ch.muted) ~= 'boolean' then
+    error('field muted must be a boolean')
+  end
+  local before = note_snapshot(take, note_index)
+  local start_qn = ch.start_beats or before.start_beats
+  local len_qn = ch.length_beats or before.length_beats
+  local sppq = reaper.MIDI_GetPPQPosFromProjQN(take, start_qn)
+  local eppq = reaper.MIDI_GetPPQPosFromProjQN(take, start_qn + len_qn)
+  reaper.Undo_BeginBlock2(0)
+  local ok, err = pcall(function()
+    reaper.MIDI_SetNote(take, note_index, nil, ch.muted, sppq, eppq,
+      ch.channel, ch.pitch, ch.velocity, false)
+    reaper.MIDI_Sort(take)
+  end)
+  reaper.Undo_EndBlock2(0, 'MCP: update MIDI note', -1)
+  reaper.UpdateArrange()
+  if not ok then error(err) end
+  local after = { pitch = ch.pitch or before.pitch,
+                  velocity = ch.velocity or before.velocity,
+                  channel = ch.channel or before.channel,
+                  start_beats = start_qn, length_beats = len_qn }
+  return { ret = { before = before, after = after } }
+end
+
+-- delete_midi_notes(track_index, item_index, note_indices[])
+--   按降序删除避免索引位移;单个 undo 块;返回被删音符快照与前后数量。
+function DSL.delete_midi_notes(ti, ii, idxs)
+  local take = midi_take_at(ti, ii)
+  local _, noteCount = reaper.MIDI_CountEvts(take)
+  local seen, order = {}, {}
+  for _, i in ipairs(idxs or {}) do
+    if type(i) ~= 'number' or i % 1 ~= 0 or i < 0 or i >= noteCount then
+      error('no note at index ' .. tostring(i) .. ' (count ' .. tostring(noteCount) .. ')')
+    end
+    if not seen[i] then seen[i] = true; order[#order + 1] = i end
+  end
+  table.sort(order, function(a, b) return a > b end)
+  local deleted = {}
+  for _, i in ipairs(order) do deleted[#deleted + 1] = note_snapshot(take, i) end
+  reaper.Undo_BeginBlock2(0)
+  for _, i in ipairs(order) do reaper.MIDI_DeleteNote(take, i) end
+  reaper.MIDI_Sort(take)
+  reaper.Undo_EndBlock2(0, 'MCP: delete MIDI notes', -1)
+  reaper.UpdateArrange()
+  local _, afterCount = reaper.MIDI_CountEvts(take)
+  return { ret = { deleted = deleted,
+                   note_count = { before = noteCount, after = afterCount } } }
+end
+
+-- replace_midi_notes(track_index, item_index, notes[])
+--   原子替换整个 take 的音符:删全部 + 插入新集合,一个 undo 步。
+--   note 格式与 add_midi_notes 相同(含 muted,回灌 get_midi_notes 输出保真)。
+--   全部校验在删除之前:进了 undo 块就不允许失败。
+function DSL.replace_midi_notes(ti, ii, notes)
+  local take = midi_take_at(ti, ii)
+  validate_notes(notes)
+  local _, beforeCount = reaper.MIDI_CountEvts(take)
+  reaper.Undo_BeginBlock2(0)
+  local ok, err = pcall(function()
+    for i = beforeCount - 1, 0, -1 do
+      reaper.MIDI_DeleteNote(take, i)
+    end
+    insert_notes(take, notes)
+    reaper.MIDI_Sort(take)
+  end)
+  reaper.Undo_EndBlock2(0, 'MCP: replace MIDI notes', -1)
+  reaper.UpdateArrange()
+  if not ok then error(err) end
+  local inserted = #(notes or {})
+  return { ret = { removed = beforeCount, inserted = inserted,
+                   note_count = { before = beforeCount, after = inserted } } }
 end
 
 function DSL.add_track_fx(ti, fx_name)
