@@ -479,7 +479,8 @@ tool(
 tool(
     "render_project",
     "Render the project using its most recent render settings. Optionally "
-    "override the output file path.",
+    "override the output file path. DESTRUCTIVE: writing to an existing path "
+    "OVERWRITES that file with no undo -- confirm the target with the user.",
     obj({"path": {"type": "string"}}),
     lambda b, a: b.call("render_project", [a.get("path")], timeout=RENDER_TIMEOUT),
 )
@@ -490,7 +491,9 @@ tool(
     "-- the bridge from REAPER to audio analysis. out_path is OPTIONAL: leave "
     "it out for analysis renders and the file lands in a managed temp folder "
     "that is auto-pruned (last %d kept), so nothing accumulates; only set it "
-    "when the user asked to export to a specific place. source is one of: "
+    "when the user asked to export to a specific place -- an explicit "
+    "out_path OVERWRITES any existing file at that path with no undo. source "
+    "is one of: "
     "'time_selection' (master mix over the current time selection; the "
     "default), 'master' (whole-project master mix), 'track:N' (track N soloed "
     "through the master, 0-based), or 'region:N' (the N-th region, 0-based in "
