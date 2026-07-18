@@ -437,6 +437,13 @@ local function validate_notes(notes)
   end
 end
 
+-- MIDI take 修改的 undo 记录：Begin/EndBlock2 的差分器看不见纯 MIDI 编辑
+-- （真机实测 flag -1/4 均不生成新点，改动会被折进下一个无关的撤销点），
+-- 必须用 Undo_OnStateChange_Item —— 每次调用可靠生成一个独立撤销点。
+local function record_item_undo(take, desc)
+  reaper.Undo_OnStateChange_Item(0, desc, reaper.GetMediaItemTake_Item(take))
+end
+
 local function insert_notes(take, notes)
   local count = 0
   for _, nt in ipairs(notes or {}) do
@@ -460,6 +467,7 @@ function DSL.add_midi_notes(ti, ii, notes)
   validate_notes(notes)
   local count = insert_notes(take, notes)
   reaper.MIDI_Sort(take)
+  record_item_undo(take, 'MCP: add MIDI notes')
   reaper.UpdateArrange()
   return { ret = { inserted = count } }
 end
@@ -509,13 +517,12 @@ function DSL.update_midi_note(ti, ii, note_index, changes)
   local len_qn = ch.length_beats or before.length_beats
   local sppq = reaper.MIDI_GetPPQPosFromProjQN(take, start_qn)
   local eppq = reaper.MIDI_GetPPQPosFromProjQN(take, start_qn + len_qn)
-  reaper.Undo_BeginBlock2(0)
   local ok, err = pcall(function()
     reaper.MIDI_SetNote(take, note_index, nil, ch.muted, sppq, eppq,
       ch.channel, ch.pitch, ch.velocity, false)
     reaper.MIDI_Sort(take)
   end)
-  reaper.Undo_EndBlock2(0, 'MCP: update MIDI note', -1)
+  record_item_undo(take, 'MCP: update MIDI note')
   reaper.UpdateArrange()
   if not ok then error(err) end
   local after = { pitch = ch.pitch or before.pitch,
@@ -540,10 +547,9 @@ function DSL.delete_midi_notes(ti, ii, idxs)
   table.sort(order, function(a, b) return a > b end)
   local deleted = {}
   for _, i in ipairs(order) do deleted[#deleted + 1] = note_snapshot(take, i) end
-  reaper.Undo_BeginBlock2(0)
   for _, i in ipairs(order) do reaper.MIDI_DeleteNote(take, i) end
   reaper.MIDI_Sort(take)
-  reaper.Undo_EndBlock2(0, 'MCP: delete MIDI notes', -1)
+  record_item_undo(take, 'MCP: delete MIDI notes')
   reaper.UpdateArrange()
   local _, afterCount = reaper.MIDI_CountEvts(take)
   return { ret = { deleted = deleted,
@@ -558,7 +564,6 @@ function DSL.replace_midi_notes(ti, ii, notes)
   local take = midi_take_at(ti, ii)
   validate_notes(notes)
   local _, beforeCount = reaper.MIDI_CountEvts(take)
-  reaper.Undo_BeginBlock2(0)
   local ok, err = pcall(function()
     for i = beforeCount - 1, 0, -1 do
       reaper.MIDI_DeleteNote(take, i)
@@ -566,7 +571,7 @@ function DSL.replace_midi_notes(ti, ii, notes)
     insert_notes(take, notes)
     reaper.MIDI_Sort(take)
   end)
-  reaper.Undo_EndBlock2(0, 'MCP: replace MIDI notes', -1)
+  record_item_undo(take, 'MCP: replace MIDI notes')
   reaper.UpdateArrange()
   if not ok then error(err) end
   local inserted = #(notes or {})
