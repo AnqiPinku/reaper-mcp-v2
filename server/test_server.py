@@ -46,7 +46,8 @@ def fake_bridge(bridge_dir, stop):
                 ret = 1  # pretend the lua returned 1
             elif func == "batch":
                 calls = payload["args"][0]
-                ret = [{"ok": True, "ret": {"echo": c.get("func")}}
+                ret = [{"ok": True, "ret": {"echo": c.get("func"),
+                                               "args": c.get("args")}}
                        for c in calls]
             elif func == "render_to_wav":
                 ret = {"path": payload["args"][0],
@@ -186,6 +187,18 @@ def main():
         check("batch runs N calls in one round-trip",
               len(body) == 2 and body[0]["ret"]["echo"] == "add_track"
               and body[1]["ret"]["echo"] == "set_tempo")
+
+        r = rpc(proc, {"jsonrpc": "2.0", "id": 13, "method": "tools/call",
+                       "params": {"name": "batch",
+                                  "arguments": {"calls": [
+                                      {"func": "add_track",
+                                       "args": [{"name": "Chords"}]},
+                                      {"func": "set_tempo",
+                                       "arguments": {"bpm": 95}}]}}})
+        body = json.loads(r["result"]["content"][0]["text"])
+        check("batch normalizes MCP-style object arguments",
+              body[0]["ret"]["args"] == ["Chords", None]
+              and body[1]["ret"]["args"] == [95])
 
     finally:
         stop.set()

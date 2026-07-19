@@ -170,6 +170,51 @@ def obj(props, required=None):
     }
 
 
+class _BatchCapture:
+    """Capture a high-level tool builder as one bridge batch call."""
+
+    def call(self, func, args=None, code=None, timeout=None):
+        del timeout
+        call = {"func": func}
+        if code is not None:
+            call["code"] = code
+        else:
+            call["args"] = args or []
+        return call
+
+
+def normalize_batch_calls(calls):
+    """Normalize high-level object arguments while preserving raw bridge calls.
+
+    Models occasionally put one MCP-style argument object inside ``args``.
+    Passing that object straight to Lua can coerce it into a track name such
+    as ``table: 0x...``. Known tools are normalized through their own builder;
+    positional DSL/ReaScript calls keep their original representation.
+    """
+    normalized = []
+    for original in calls:
+        call = dict(original)
+        func = call.get("func")
+        high_level_args = call.get("arguments")
+        raw_args = call.get("args", [])
+        if (
+            high_level_args is None
+            and isinstance(raw_args, list)
+            and len(raw_args) == 1
+            and isinstance(raw_args[0], dict)
+        ):
+            high_level_args = raw_args[0]
+        spec = TOOL_INDEX.get(func)
+        if (
+            isinstance(high_level_args, dict)
+            and spec is not None
+            and func not in ("batch", "reaper_call", "run_lua")
+        ):
+            call = spec["_builder"](_BatchCapture(), high_level_args)
+        normalized.append(call)
+    return normalized
+
+
 tool(
     "reaper_status",
     "Check the bridge connection and return a summary of the open REAPER "
@@ -539,7 +584,10 @@ tool(
     "a 16-note drum pattern, or a whole 'add track + add FX + set params' "
     "setup, costs a single hop rather than a dozen. 'calls' is an array; each "
     "item is {\"func\": <name>, \"args\": [...]} where func is any tool/DSL or "
-    "ReaScript name (exactly like reaper_call), or {\"func\": \"run_lua\", "
+    "ReaScript name (exactly like reaper_call). For known high-level tools, "
+    "{\"func\": \"add_track\", \"arguments\": {\"name\": \"Chords\"}} is also "
+    "accepted and avoids positional mistakes. A legacy one-object args array "
+    "is normalized the same way. Or use {\"func\": \"run_lua\", "
     "\"code\": \"...\"}. Handles returned by an earlier call in the SAME batch "
     "can be passed into a later one. Returns an array of per-call results, each "
     "{\"ok\": true, \"ret\": ...} or {\"ok\": false, \"error\": ...}; one "
@@ -547,10 +595,11 @@ tool(
     obj({"calls": {"type": "array", "items": obj({
         "func": {"type": "string"},
         "args": {"type": "array"},
+        "arguments": {"type": "object"},
         "code": {"type": "string"}},
         ["func"])}},
         ["calls"]),
-    lambda b, a: b.call("batch", [a["calls"]]),
+    lambda b, a: b.call("batch", [normalize_batch_calls(a["calls"])]),
 )
 
 
