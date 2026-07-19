@@ -19,6 +19,7 @@ import time
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 SERVER = os.path.join(HERE, "reaper_mcp_server.py")
+BRIDGE = os.path.join(os.path.dirname(HERE), "bridge", "reaper_mcp_bridge.lua")
 
 
 def fake_bridge(bridge_dir, stop):
@@ -96,6 +97,12 @@ def main():
             failures.append(label)
 
     try:
+        with open(BRIDGE, encoding="utf-8") as f:
+            bridge_source = f.read()
+        check("absolute beats anchor TimeMap2 conversion at project measure 0",
+              "TimeMap2_beatsToTime(0, b, 0)" in bridge_source
+              and "TimeMap2_beatsToTime(0, b, -1)" not in bridge_source)
+
         r = rpc(proc, {"jsonrpc": "2.0", "id": 1, "method": "initialize",
                        "params": {}})
         check("initialize returns serverInfo",

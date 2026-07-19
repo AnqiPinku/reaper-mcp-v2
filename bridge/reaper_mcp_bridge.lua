@@ -273,7 +273,11 @@ local function track_at(i)
   if not t then error('no track at index ' .. tostring(i)) end
   return t
 end
-local function beats_to_time(b) return reaper.TimeMap2_beatsToTime(0, b, -1) end
+-- TimeMap2_beatsToTime interprets its beat argument inside measuresIn.  These
+-- DSL positions are absolute project quarter-notes, so anchor them at project
+-- measure 0.  Passing -1 makes beat 0 resolve into the preceding measure on a
+-- real REAPER timeline.
+local function beats_to_time(b) return reaper.TimeMap2_beatsToTime(0, b, 0) end
 local function time_to_beats(t)
   local _, _, _, fullbeats = reaper.TimeMap2_timeToBeats(0, t)
   return fullbeats
