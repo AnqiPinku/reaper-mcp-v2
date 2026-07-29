@@ -463,6 +463,26 @@ local function insert_notes(take, notes)
   return count
 end
 
+-- item 是显示/播放窗口:超出右边界的音符存在于 take 里但不可见不发声。
+-- 写入内容越界时自动把 item 拉长到能装下最后一个音符,返回是否延长过。
+local function extend_item_to_notes(take, notes)
+  local max_qn = nil
+  for _, nt in ipairs(notes or {}) do
+    local e = (nt.start_beats or 0) + (nt.length_beats or 0)
+    if not max_qn or e > max_qn then max_qn = e end
+  end
+  if not max_qn then return false end
+  local item = reaper.GetMediaItemTake_Item(take)
+  local want_end = reaper.TimeMap2_QNToTime(0, max_qn)
+  local pos = reaper.GetMediaItemInfo_Value(item, 'D_POSITION')
+  local len = reaper.GetMediaItemInfo_Value(item, 'D_LENGTH')
+  if want_end > pos + len + 1e-9 then
+    reaper.SetMediaItemInfo_Value(item, 'D_LENGTH', want_end - pos)
+    return true
+  end
+  return false
+end
+
 -- add_midi_notes(track_index, item_index, notes[])
 --   note = {pitch, start_beats, length_beats, velocity=96, channel=0, muted=false}
 --   纯追加；重写/修正现有音符用 replace_midi_notes / update_midi_note。
@@ -471,9 +491,10 @@ function DSL.add_midi_notes(ti, ii, notes)
   validate_notes(notes)
   local count = insert_notes(take, notes)
   reaper.MIDI_Sort(take)
+  local extended = extend_item_to_notes(take, notes)
   record_item_undo(take, 'MCP: add MIDI notes')
   reaper.UpdateArrange()
-  return { ret = { inserted = count } }
+  return { ret = { inserted = count, item_extended = extended } }
 end
 
 function DSL.get_midi_notes(ti, ii)
@@ -525,6 +546,7 @@ function DSL.update_midi_note(ti, ii, note_index, changes)
     reaper.MIDI_SetNote(take, note_index, nil, ch.muted, sppq, eppq,
       ch.channel, ch.pitch, ch.velocity, false)
     reaper.MIDI_Sort(take)
+    extend_item_to_notes(take, { { start_beats = start_qn, length_beats = len_qn } })
   end)
   record_item_undo(take, 'MCP: update MIDI note')
   reaper.UpdateArrange()
@@ -568,18 +590,21 @@ function DSL.replace_midi_notes(ti, ii, notes)
   local take = midi_take_at(ti, ii)
   validate_notes(notes)
   local _, beforeCount = reaper.MIDI_CountEvts(take)
+  local extended = false
   local ok, err = pcall(function()
     for i = beforeCount - 1, 0, -1 do
       reaper.MIDI_DeleteNote(take, i)
     end
     insert_notes(take, notes)
     reaper.MIDI_Sort(take)
+    extended = extend_item_to_notes(take, notes)
   end)
   record_item_undo(take, 'MCP: replace MIDI notes')
   reaper.UpdateArrange()
   if not ok then error(err) end
   local inserted = #(notes or {})
   return { ret = { removed = beforeCount, inserted = inserted,
+                   item_extended = extended,
                    note_count = { before = beforeCount, after = inserted } } }
 end
 

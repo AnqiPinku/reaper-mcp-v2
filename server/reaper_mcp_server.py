@@ -330,7 +330,8 @@ tool(
     "update_midi_note instead (appending corrected copies duplicates notes). "
     "Each note: {pitch (0-127, 60=middle C), start_beats (absolute, from "
     "project start), length_beats, velocity (1-127, default 96), channel "
-    "(0-15, default 0), muted (default false)}.",
+    "(0-15, default 0), muted (default false)}. The item auto-extends when "
+    "notes run past its right edge (item_extended in the result).",
     obj({"track_index": {"type": "integer", "minimum": 0},
          "item_index": {"type": "integer", "minimum": 0},
          "notes": {"type": "array", "items": NOTE_SCHEMA}},
@@ -396,7 +397,9 @@ tool(
     "undo step. Use this (not add_midi_notes, which only APPENDS and would "
     "duplicate notes) for pitch correction and bulk rewrites. You may feed "
     "get_midi_notes output straight back in (extra fields like index/"
-    "selected are ignored; muted is preserved). Refuses an empty set -- to "
+    "selected are ignored; muted is preserved). The item auto-extends when "
+    "notes run past its right edge (item_extended in the result). Refuses "
+    "an empty set -- to "
     "wipe an item use delete_midi_notes with all indices. Returns removed/"
     "inserted counts.",
     obj({"track_index": {"type": "integer", "minimum": 0},
